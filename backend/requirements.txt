@@ -1,9 +1,10 @@
 fastapi
-uvicorn[standard]
-motor
+uvicorn
 python-dotenv
-openai
+motor
 transformers
 datasets
-torch
+torch           # or torch-cpu
+huggingface-hub
+openai
 python-multipart
