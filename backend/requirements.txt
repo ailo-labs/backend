@@ -6,3 +6,4 @@ openai
 transformers
 datasets
 torch
+python-multipart
