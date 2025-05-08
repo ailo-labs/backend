@@ -4,7 +4,7 @@ python-dotenv
 motor
 transformers
 datasets
-torch           # or torch-cpu
+torch
 huggingface-hub
 openai
 python-multipart
