@@ -3,18 +3,17 @@
 Ailo Forge Backend (main.py)
 
 Features:
+  • List available models
   • Modify model generation settings in-place
   • Chat with local HF models, or fallback to OpenAI GPT-4
   • Fine-tune base models via Hugging Face Trainer with real checkpointing & optional Hub push
   • Pollable progress endpoint
 """
-
 import os
 import logging
 import uuid
 import json
-import asyncio
-from typing import List, Dict
+from typing import List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +31,7 @@ from transformers import (
     TrainingArguments,
 )
 from datasets import Dataset
-from huggingface_hub import login as hf_login
+from huggingface_hub import login as hf_login, snapshot_download
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Load env & initialize
@@ -42,17 +41,18 @@ logging.basicConfig(level=logging.INFO)
 
 # OpenAI GPT-4 fallback
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
-if not OPENAI_API_KEY:
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+else:
     logging.warning("OPENAI_API_KEY not set; GPT-4 fallback disabled")
 
-# Hugging Face Hub (for push_to_hub and private models)
-HF_HUB_TOKEN = os.getenv("HF_HUB_TOKEN")
+# Hugging Face Hub
+HF_HUB_TOKEN   = os.getenv("HF_HUB_TOKEN")
 HF_HUB_REPO_ID = os.getenv("HF_HUB_REPO_ID")
 if HF_HUB_TOKEN:
     hf_login(HF_HUB_TOKEN)
 
-# MongoDB (for storing state if you need it)
+# MongoDB (state storage)
 MONGO_URI = os.getenv("MONGO_URI") or ""
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is required")
@@ -72,64 +72,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-progress_store: Dict[str, Dict[str, any]] = {}
-model_pipelines: Dict[str, any] = {}
+# In-memory stores
+progress_store: Dict[str, Dict[str, Any]] = {}
+model_pipelines: Dict[str, Any]        = {}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) Pydantic schemas
+# ─────────────────────────────────────────────────────────────────────────────
 class ModifyRequest(BaseModel):
-    model_version: str
+    model_version: str = Field(..., alias="modelVersion")
     temperature: float
     token_limit: int = Field(..., alias="tokenLimit")
     instructions: str = Field("", alias="instructions")
 
     class Config:
-        allow_population_by_field_name = True
         allow_population_by_alias = True
+        allow_population_by_field_name = True
 
+class RunRequest(BaseModel):
+    model_version: str = Field(..., alias="modelVersion")
+    prompt: str
+
+    class Config:
+        allow_population_by_alias = True
+        allow_population_by_field_name = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def healthcheck():
     return {"status": "ok", "message": "Ailo Forge backend live"}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3) Modify generation settings
-# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/models")
+async def list_models():
+    base = "models"
+    if not os.path.isdir(base):
+        return {"models": []}
+    entries = [d for d in os.listdir(base)
+               if os.path.isdir(os.path.join(base, d))]
+    return {"models": entries}
+
 @app.post("/modify-file")
 async def modify_file(req: ModifyRequest):
     local_dir = os.path.join("models", req.model_version)
-    cfg_path = os.path.join(local_dir, "config.json")
+    cfg_path  = os.path.join(local_dir, "config.json")
     if not os.path.isdir(local_dir) or not os.path.isfile(cfg_path):
-        raise HTTPException(404, detail="Local model folder or config.json missing")
-    with open(cfg_path) as f:
+        raise HTTPException(404, detail="Model folder or config.json missing")
+
+    # Load and update
+    with open(cfg_path, "r") as f:
         cfg = json.load(f)
-
-    # Overwrite HF config fields (you can add others)
     cfg["temperature"] = req.temperature
-    cfg["tokenLimit"] = req.token_limit
+    cfg["tokenLimit"]  = req.token_limit
     cfg["instructions"] = req.instructions
-
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
 
-    # Clear cached pipeline so new settings reload
+    # Purge pipeline cache
     model_pipelines.pop(req.model_version, None)
-    return {"success": True, "message": "Generation config updated"}
+    return {"success": True, "message": "Config updated"}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4) Chat endpoint
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/run")
-async def run_model(payload: Dict):
-    mv = payload.get("model_version")
-    prompt = payload.get("prompt")
-    if not mv or not prompt:
-        raise HTTPException(400, detail="model_version and prompt are required")
-
+async def run_model(req: RunRequest):
+    mv = req.model_version
+    prompt = req.prompt
     local_dir = os.path.join("models", mv)
-    if os.path.isdir(local_dir):
-        # Load saved defaults
-        cfg = AutoConfig.from_pretrained(local_dir)
-        temp = getattr(cfg, "temperature", 0.7)
-        max_len = getattr(cfg, "tokenLimit", 150)
 
+    # Local HF pipeline
+    if os.path.isdir(local_dir):
+        cfg     = AutoConfig.from_pretrained(local_dir)
+        temp    = getattr(cfg, "temperature", 0.7)
+        max_len = getattr(cfg, "tokenLimit", 150)
         if mv not in model_pipelines:
             tok = AutoTokenizer.from_pretrained(local_dir)
             mod = AutoModelForCausalLM.from_pretrained(local_dir)
@@ -142,24 +156,31 @@ async def run_model(payload: Dict):
         gen = model_pipelines[mv]
         out = gen(prompt, max_length=max_len, temperature=temp)
         text = out[0]["generated_text"]
-
+    # HF Hub fallback
+    elif HF_HUB_TOKEN:
+        repo_dir = snapshot_download(mv, cache_dir="models")
+        cfg     = AutoConfig.from_pretrained(repo_dir)
+        temp    = getattr(cfg, "temperature", 0.7)
+        max_len = getattr(cfg, "tokenLimit", 150)
+        tok = AutoTokenizer.from_pretrained(repo_dir)
+        mod = AutoModelForCausalLM.from_pretrained(repo_dir)
+        gen = pipeline("text-generation", model=mod, tokenizer=tok, device_map="auto")
+        out = gen(prompt, max_length=max_len, temperature=temp)
+        text = out[0]["generated_text"]
+    # OpenAI fallback
     elif OPENAI_API_KEY:
-        # updated to openai-python v1 interface
         resp = openai.chat.completions.create(
             model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0.7,
             max_tokens=150,
         )
         text = resp.choices[0].message.content.strip()
     else:
-        text = prompt[::-1]  # fallback
+        text = ""  # no source available
 
     return {"success": True, "response": text}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) Fine-tune endpoint
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/train")
 async def train_model(
     base_model: str = Form(...),
@@ -167,7 +188,8 @@ async def train_model(
     files: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = None,
 ):
-    texts = []
+    # gather text
+    texts: List[str] = []
     for f in files:
         data = await f.read()
         if not (data.startswith(b"\xFF\xD8") or data.startswith(b"\x89PNG")):
@@ -176,28 +198,25 @@ async def train_model(
         raise HTTPException(400, detail="No valid text data provided")
 
     job_id = str(uuid.uuid4())
-    progress_store[job_id] = {"percent": 0, "status": "in_progress"}
+    progress_store[job_id] = {"percent":0, "status":"in_progress"}
     background_tasks.add_task(_run_training, job_id, base_model, texts)
     return {"job_id": job_id, "status": "training_started"}
 
-
 def _run_training(job_id: str, base_model: str, texts: List[str]):
     try:
+        # fetch or load model
         local_dir = os.path.join("models", base_model)
         if os.path.isdir(local_dir):
             model_id = local_dir
         elif HF_HUB_TOKEN:
-            model_id = base_model
+            model_id = snapshot_download(base_model, cache_dir="models")
         else:
-            raise RuntimeError("Base model not found locally or no HF_HUB_TOKEN")
+            raise RuntimeError("Base model not found and no HF_HUB_TOKEN")
 
         tok = AutoTokenizer.from_pretrained(model_id)
         mod = AutoModelForCausalLM.from_pretrained(model_id)
-        ds = Dataset.from_dict({"text": texts})
-        ds = ds.map(
-            lambda x: tok(x["text"], truncation=True, max_length=128),
-            batched=True,
-        )
+        ds  = Dataset.from_dict({"text":texts})
+        ds  = ds.map(lambda x: tok(x["text"], truncation=True, max_length=128), batched=True)
 
         out_dir = os.path.join("models", f"{base_model}-ft-{job_id}")
         args = TrainingArguments(
@@ -216,14 +235,11 @@ def _run_training(job_id: str, base_model: str, texts: List[str]):
         if HF_HUB_TOKEN:
             trainer.push_to_hub()
 
-        progress_store[job_id] = {"percent": 100, "status": "completed"}
+        progress_store[job_id] = {"percent":100, "status":"completed"}
     except Exception:
         logging.exception("Training failed")
-        progress_store[job_id] = {"percent": 0, "status": "failed"}
+        progress_store[job_id] = {"percent":0, "status":"failed"}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6) Progress endpoint
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/progress/{job_id}")
 async def get_progress(job_id: str):
     if job_id in progress_store:
@@ -231,13 +247,8 @@ async def get_progress(job_id: str):
     raise HTTPException(404, detail="Job not found")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7) Run if invoked directly
+# 5) Run with Uvicorn
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=True,
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8000")), reload=True)
