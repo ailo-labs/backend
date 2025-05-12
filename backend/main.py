@@ -13,7 +13,7 @@ import os
 import logging
 import uuid
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,37 +36,37 @@ from datasets import Dataset
 from huggingface_hub import login as hf_login, snapshot_download
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) Load env & initialize
+# 1) Load environment variables and initialize clients
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# OpenAI GPT-4 fallback
+# Database
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI is required")
+client = AsyncIOMotorClient(MONGO_URI)
+DB_NAME = os.getenv("MONGODB_DB_NAME") or None
+db = client.get_default_database() if DB_NAME is None else client[DB_NAME]
+model_states = db["model_states"]
+
+# Hugging Face hub
+HF_HUB_TOKEN   = os.getenv("HF_HUB_TOKEN")
+HF_HUB_REPO_ID = os.getenv("HF_HUB_REPO_ID")
+if HF_HUB_TOKEN:
+    hf_login(HF_HUB_TOKEN)
+
+# OpenAI API
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 else:
     logging.warning("OPENAI_API_KEY not set; GPT-4 fallback disabled")
 
-# Hugging Face Hub
-HF_HUB_TOKEN   = os.getenv("HF_HUB_TOKEN")
-HF_HUB_REPO_ID = os.getenv("HF_HUB_REPO_ID")
-if HF_HUB_TOKEN:
-    hf_login(HF_HUB_TOKEN)
-
-# MongoDB (state storage)
-MONGO_URI = os.getenv("MONGO_URI") or ""
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI is required")
-client = AsyncIOMotorClient(MONGO_URI)
-DB_NAME = os.getenv("MONGODB_DB_NAME")
-db = client.get_default_database() if not DB_NAME else client[DB_NAME]
-model_states = db["model_states"]
-
-# Friendly name to HF repo mapping
+# Map friendly model names to HF repo IDs
 MODEL_REPO_IDS: Dict[str, str] = {
-    "7B-BASE": "username/7b-base",
-    "67B-CHAT": "username/67b-chat",
+    "7B-BASE": "your-org/7b-base",
+    "67B-CHAT": "your-org/67b-chat",
     "LLAMA-3-8B": "meta-llama/Llama-3-8b",
     "MISTRAL-7B": "mistralai/mistral-7b",
     "FALCON-40B": "tiiuae/falcon-40b",
@@ -85,24 +85,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global exception handler for validation errors
+# Exception handler to return clear validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # return JSON with detail list
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-# In-memory stores
+# In-memory caches
 progress_store: Dict[str, Dict[str, Any]] = {}
-model_pipelines: Dict[str, Any]        = {}
+model_pipelines: Dict[str, Any] = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) Pydantic schemas
+# 3) Pydantic request schemas
 # ─────────────────────────────────────────────────────────────────────────────
 class ModifyRequest(BaseModel):
     model_version: str = Field(..., alias="modelVersion")
     temperature: float
-    token_limit: int   = Field(..., alias="tokenLimit")
-    instructions: str  = Field("", alias="instructions")
+    token_limit: int = Field(..., alias="tokenLimit")
+    instructions: str = Field("", alias="instructions")
 
     class Config:
         allow_population_by_alias = True
@@ -117,36 +116,42 @@ class RunRequest(BaseModel):
         populate_by_name = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) Endpoints
+# 4) API endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
-async def healthcheck():
+async def healthcheck() -> Dict[str, str]:
     return {"status": "ok", "message": "Ailo Forge backend live"}
 
 @app.get("/models")
-async def list_models():
-    local = [d for d in os.listdir("models") if os.path.isdir(os.path.join("models", d))]
+async def list_models() -> Dict[str, List[str]]:
+    # list friendly names + any extras in ./models
+    local = []
+    if os.path.isdir("models"):
+        local = [d for d in os.listdir("models") if os.path.isdir(os.path.join("models", d))]
+    # combine without duplicates
     combined = list(dict.fromkeys(list(MODEL_REPO_IDS.keys()) + local))
     return {"models": combined}
 
 @app.post("/modify-file")
-async def modify_file(req: ModifyRequest):
+async def modify_file(req: ModifyRequest) -> Dict[str, Any]:
     mv = req.model_version
     cfg_path = os.path.join("models", mv, "config.json")
     if not os.path.isfile(cfg_path):
-        raise HTTPException(404, detail="Model folder or config.json missing")
+        raise HTTPException(404, detail="Model or config.json not found")
 
+    # update config
     cfg = json.load(open(cfg_path))
     cfg["temperature"] = req.temperature
-    cfg["tokenLimit"]    = req.token_limit
-    cfg["instructions"]  = req.instructions
+    cfg["tokenLimit"] = req.token_limit
+    cfg["instructions"] = req.instructions
     json.dump(cfg, open(cfg_path, "w"), indent=2)
 
+    # clear cache
     model_pipelines.pop(mv, None)
     return {"success": True, "message": "Config updated"}
 
 @app.post("/run")
-async def run_model(req: RunRequest):
+async def run_model(req: RunRequest) -> Dict[str, Any]:
     mv = req.model_version
     prompt = req.prompt
 
@@ -159,49 +164,48 @@ async def run_model(req: RunRequest):
     elif OPENAI_API_KEY:
         src = None
     else:
-        raise HTTPException(404, detail="Model not found")
+        raise HTTPException(404, detail="Model not found locally or on HF Hub, and no OpenAI key")
 
+    # generate
     if src:
-        cfg     = AutoConfig.from_pretrained(src)
-        temp    = getattr(cfg, "temperature", 0.7)
+        cfg = AutoConfig.from_pretrained(src)
+        temp = getattr(cfg, "temperature", 0.7)
         max_len = getattr(cfg, "tokenLimit", 150)
         if mv not in model_pipelines:
             tok = AutoTokenizer.from_pretrained(src)
             mod = AutoModelForCausalLM.from_pretrained(src)
-            model_pipelines[mv] = pipeline(
-                "text-generation", model=mod, tokenizer=tok, device_map="auto"
-            )
+            model_pipelines[mv] = pipeline("text-generation", model=mod, tokenizer=tok, device_map="auto")
         out = model_pipelines[mv](prompt, max_length=max_len, temperature=temp)
         text = out[0]["generated_text"]
     else:
-        resp = openai.chat.completions.create(
-            model="gpt-4", messages=[{"role":"user","content":prompt}],
-            temperature=0.7, max_tokens=150,
-        )
+        resp = openai.chat.completions.create(model="gpt-4", messages=[{"role":"user","content":prompt}], temperature=0.7, max_tokens=150)
         text = resp.choices[0].message.content.strip()
 
     return {"success": True, "response": text}
 
 @app.post("/train")
 async def train_model(
-    base_model: str = Form(...), trainingObjective: str = Form(...),
-    files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = None,
-):
+    base_model: str = Form(...),
+    trainingObjective: str = Form(...),
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None,
+) -> Dict[str, Any]:
+    # collect text
     texts: List[str] = []
     for f in files:
         data = await f.read()
         if not data.startswith((b"\xFF\xD8", b"\x89PNG")):
-            texts.append(data.decode(errors="ignore"))
+            texts.append(data.decode("utf-8", errors="ignore"))
     if not texts:
         raise HTTPException(400, detail="No valid text data provided")
 
     job_id = str(uuid.uuid4())
-    progress_store[job_id] = {"percent":0, "status":"in_progress"}
+    progress_store[job_id] = {"percent": 0, "status": "in_progress"}
     background_tasks.add_task(_run_training, job_id, base_model, texts)
     return {"job_id": job_id, "status": "training_started"}
 
 
-def _run_training(job_id: str, base_model: str, texts: List[str]):
+def _run_training(job_id: str, base_model: str, texts: List[str]) -> None:
     try:
         if os.path.isdir(os.path.join("models", base_model)):
             model_id = os.path.join("models", base_model)
@@ -212,33 +216,41 @@ def _run_training(job_id: str, base_model: str, texts: List[str]):
 
         tok = AutoTokenizer.from_pretrained(model_id)
         mod = AutoModelForCausalLM.from_pretrained(model_id)
-        ds  = Dataset.from_dict({"text":texts})
-        ds  = ds.map(lambda x: tok(x["text"], truncation=True, max_length=128), batched=True)
+        ds = Dataset.from_dict({"text": texts})
+        ds = ds.map(lambda x: tok(x["text"], truncation=True, max_length=128), batched=True)
 
         out_dir = os.path.join("models", f"{base_model}-ft-{job_id}")
         args = TrainingArguments(
-            output_dir=out_dir, num_train_epochs=3, per_device_train_batch_size=2,
-            logging_steps=10, save_steps=50,
-            push_to_hub=bool(HF_HUB_TOKEN), hub_token=HF_HUB_TOKEN,
+            output_dir=out_dir,
+            num_train_epochs=3,
+            per_device_train_batch_size=2,
+            logging_steps=10,
+            save_steps=50,
+            push_to_hub=bool(HF_HUB_TOKEN),
+            hub_token=HF_HUB_TOKEN,
             hub_model_id=HF_HUB_REPO_ID or f"{base_model}-ft-{job_id}",
         )
         trainer = Trainer(model=mod, args=args, train_dataset=ds, tokenizer=tok)
-        trainer.train(); trainer.save_model(out_dir)
-        if HF_HUB_TOKEN: trainer.push_to_hub()
-        progress_store[job_id] = {"percent":100, "status":"completed"}
+        trainer.train()
+        trainer.save_model(out_dir)
+        if HF_HUB_TOKEN:
+            trainer.push_to_hub()
+
+        progress_store[job_id] = {"percent": 100, "status": "completed"}
     except Exception:
         logging.exception("Training failed")
-        progress_store[job_id] = {"percent":0, "status":"failed"}
+        progress_store[job_id] = {"percent": 0, "status": "failed"}
 
 @app.get("/progress/{job_id}")
-async def get_progress(job_id: str):
+async def get_progress(job_id: str) -> Dict[str, Any]:
     if job_id in progress_store:
         return progress_store[job_id]
     raise HTTPException(404, detail="Job not found")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) Run Uvicorn
+# Run the app
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8080")), reload=True)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
