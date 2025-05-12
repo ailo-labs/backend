@@ -61,6 +61,17 @@ DB_NAME = os.getenv("MONGODB_DB_NAME")
 db = client.get_default_database() if not DB_NAME else client[DB_NAME]
 model_states = db["model_states"]
 
+# Mapping friendly names to HF repo IDs
+MODEL_REPO_IDS: Dict[str, str] = {
+    "7B-BASE": "username/7b-base",
+    "67B-CHAT": "username/67b-chat",
+    "LLAMA-3-8B": "meta-llama/Llama-3-8b",
+    "MISTRAL-7B": "mistralai/mistral-7b",
+    "FALCON-40B": "tiiuae/falcon-40b",
+    "GPT-J-6B": "EleutherAI/gpt-j-6B",
+    "DEEPSEEK-CODER-33B": "deepseek/coder-33b",
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) FastAPI setup
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +98,7 @@ class ModifyRequest(BaseModel):
 
     class Config:
         allow_population_by_alias = True
-        allow_population_by_field_name = True
+        validate_by_name = True
 
 class RunRequest(BaseModel):
     model_version: str = Field(..., alias="modelVersion")
@@ -95,7 +106,7 @@ class RunRequest(BaseModel):
 
     class Config:
         allow_population_by_alias = True
-        allow_population_by_field_name = True
+        validate_by_name = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4) Endpoints
@@ -106,21 +117,20 @@ async def healthcheck():
 
 @app.get("/models")
 async def list_models():
-    base = "models"
-    if not os.path.isdir(base):
-        return {"models": []}
-    entries = [d for d in os.listdir(base)
-               if os.path.isdir(os.path.join(base, d))]
-    return {"models": entries}
+    # Return friendly names available in MODEL_REPO_IDS or local dirs
+    local = [d for d in os.listdir("models") if os.path.isdir(os.path.join("models", d))]
+    # Union friendly names and locals, preserving order
+    all_models = list(dict.fromkeys(list(MODEL_REPO_IDS.keys()) + local))
+    return {"models": all_models}
 
 @app.post("/modify-file")
 async def modify_file(req: ModifyRequest):
-    local_dir = os.path.join("models", req.model_version)
+    mv = req.model_version
+    local_dir = os.path.join("models", mv)
     cfg_path  = os.path.join(local_dir, "config.json")
     if not os.path.isdir(local_dir) or not os.path.isfile(cfg_path):
         raise HTTPException(404, detail="Model folder or config.json missing")
 
-    # Load and update
     with open(cfg_path, "r") as f:
         cfg = json.load(f)
     cfg["temperature"] = req.temperature
@@ -129,8 +139,7 @@ async def modify_file(req: ModifyRequest):
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
 
-    # Purge pipeline cache
-    model_pipelines.pop(req.model_version, None)
+    model_pipelines.pop(mv, None)
     return {"success": True, "message": "Config updated"}
 
 @app.post("/run")
@@ -139,14 +148,23 @@ async def run_model(req: RunRequest):
     prompt = req.prompt
     local_dir = os.path.join("models", mv)
 
-    # Local HF pipeline
+    # Determine source: local, HF Hub, or OpenAI
     if os.path.isdir(local_dir):
-        cfg     = AutoConfig.from_pretrained(local_dir)
+        src = local_dir
+    elif mv in MODEL_REPO_IDS and HF_HUB_TOKEN:
+        src = snapshot_download(MODEL_REPO_IDS[mv], cache_dir="models")
+    elif OPENAI_API_KEY:
+        src = None
+    else:
+        raise HTTPException(404, detail="Model not found locally or on HF Hub, and no OpenAI key")
+
+    if src:
+        cfg     = AutoConfig.from_pretrained(src)
         temp    = getattr(cfg, "temperature", 0.7)
         max_len = getattr(cfg, "tokenLimit", 150)
         if mv not in model_pipelines:
-            tok = AutoTokenizer.from_pretrained(local_dir)
-            mod = AutoModelForCausalLM.from_pretrained(local_dir)
+            tok = AutoTokenizer.from_pretrained(src)
+            mod = AutoModelForCausalLM.from_pretrained(src)
             model_pipelines[mv] = pipeline(
                 "text-generation",
                 model=mod,
@@ -156,19 +174,7 @@ async def run_model(req: RunRequest):
         gen = model_pipelines[mv]
         out = gen(prompt, max_length=max_len, temperature=temp)
         text = out[0]["generated_text"]
-    # HF Hub fallback
-    elif HF_HUB_TOKEN:
-        repo_dir = snapshot_download(mv, cache_dir="models")
-        cfg     = AutoConfig.from_pretrained(repo_dir)
-        temp    = getattr(cfg, "temperature", 0.7)
-        max_len = getattr(cfg, "tokenLimit", 150)
-        tok = AutoTokenizer.from_pretrained(repo_dir)
-        mod = AutoModelForCausalLM.from_pretrained(repo_dir)
-        gen = pipeline("text-generation", model=mod, tokenizer=tok, device_map="auto")
-        out = gen(prompt, max_length=max_len, temperature=temp)
-        text = out[0]["generated_text"]
-    # OpenAI fallback
-    elif OPENAI_API_KEY:
+    else:
         resp = openai.chat.completions.create(
             model="gpt-4",
             messages=[{"role":"user","content":prompt}],
@@ -176,8 +182,6 @@ async def run_model(req: RunRequest):
             max_tokens=150,
         )
         text = resp.choices[0].message.content.strip()
-    else:
-        text = ""  # no source available
 
     return {"success": True, "response": text}
 
@@ -188,7 +192,6 @@ async def train_model(
     files: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = None,
 ):
-    # gather text
     texts: List[str] = []
     for f in files:
         data = await f.read()
@@ -204,12 +207,10 @@ async def train_model(
 
 def _run_training(job_id: str, base_model: str, texts: List[str]):
     try:
-        # fetch or load model
-        local_dir = os.path.join("models", base_model)
-        if os.path.isdir(local_dir):
-            model_id = local_dir
-        elif HF_HUB_TOKEN:
-            model_id = snapshot_download(base_model, cache_dir="models")
+        if os.path.isdir(os.path.join("models", base_model)):
+            model_id = os.path.join("models", base_model)
+        elif base_model in MODEL_REPO_IDS and HF_HUB_TOKEN:
+            model_id = snapshot_download(MODEL_REPO_IDS[base_model], cache_dir="models")
         else:
             raise RuntimeError("Base model not found and no HF_HUB_TOKEN")
 
@@ -246,9 +247,7 @@ async def get_progress(job_id: str):
         return progress_store[job_id]
     raise HTTPException(404, detail="Job not found")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) Run with Uvicorn
-# ─────────────────────────────────────────────────────────────────────────────
+# Run with Uvicorn
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8000")), reload=True)
