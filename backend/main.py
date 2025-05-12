@@ -43,7 +43,7 @@ from huggingface_hub import login as hf_login, snapshot_download
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# Optional MongoDB (unused in core flows)
+# Optional MongoDB (unused core flows)
 if os.getenv("MONGO_URI"):
     from motor.motor_asyncio import AsyncIOMotorClient
     client_db = AsyncIOMotorClient(os.getenv("MONGO_URI"))
@@ -52,14 +52,17 @@ if os.getenv("MONGO_URI"):
 
 # HF Hub auth
 HF_HUB_TOKEN = os.getenv("HF_HUB_TOKEN")
-HF_HUB_REPO_ID = os.getenv("HF_HUB_REPO_ID")
 if HF_HUB_TOKEN:
     hf_login(HF_HUB_TOKEN)
+    logging.info(f"Logged into HF Hub with token: {HF_HUB_TOKEN[:8]}... ")
+else:
+    logging.warning("HF_HUB_TOKEN not set; HF Hub downloads disabled")
 
 # OpenAI client
 client_openai: Optional[OpenAI] = None
 if os.getenv("OPENAI_API_KEY"):
     client_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    logging.info("OpenAI client configured")
 else:
     logging.warning("OPENAI_API_KEY not set; GPT-4 fallback disabled")
 
@@ -148,8 +151,12 @@ async def run_model(req: RunRequest) -> Dict[str, Any]:
     instr = cfg.get("instructions", "")
 
     repo_id = MODEL_REPO_IDS.get(mv)
-    if repo_id:
-        src = snapshot_download(repo_id, cache_dir="models")
+    if repo_id and HF_HUB_TOKEN:
+        try:
+            src = snapshot_download(repo_id, cache_dir="models")
+        except Exception as e:
+            logging.error(f"HF download failed for {repo_id}: {e}")
+            raise HTTPException(502, detail=f"HF download failed: {e}")
         if mv not in model_pipelines:
             tok = AutoTokenizer.from_pretrained(src)
             mod = AutoModelForCausalLM.from_pretrained(src)
@@ -157,7 +164,7 @@ async def run_model(req: RunRequest) -> Dict[str, Any]:
         full_prompt = f"{instr}\n{prompt}".strip()
         out = model_pipelines[mv](full_prompt, max_length=max_len, temperature=temp)
         text = out[0]["generated_text"]
-    else:
+    elif client_openai:
         resp = client_openai.chat.completions.create(
             model="gpt-4",
             messages=[{"role":"system","content":instr}, {"role":"user","content":prompt}],
@@ -165,6 +172,8 @@ async def run_model(req: RunRequest) -> Dict[str, Any]:
             max_tokens=max_len,
         )
         text = resp.choices[0].message.content.strip()
+    else:
+        raise HTTPException(404, detail="No valid model source available")
 
     return {"success": True, "response": text}
 
@@ -207,7 +216,7 @@ def _run_training(job_id: str, base_model: str, texts: List[str], objective: str
             save_steps=50,
             push_to_hub=bool(HF_HUB_TOKEN),
             hub_token=HF_HUB_TOKEN,
-            hub_model_id=HF_HUB_REPO_ID or f"{base_model}-ft-{job_id}",
+            hub_model_id=HF_HUB_REPO_ID or f"{base_model}-ft-{job_id}" 
         )
         trainer = Trainer(model=mod, args=args, train_dataset=ds, tokenizer=tok)
         trainer.train()
