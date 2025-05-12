@@ -102,7 +102,7 @@ class ModifyRequest(BaseModel):
 
     class Config:
         allow_population_by_alias = True
-        populate_by_name = True
+        allow_population_by_field_name = True
 
 class RunRequest(BaseModel):
     model_version: str = Field(..., alias="modelVersion")
@@ -110,7 +110,7 @@ class RunRequest(BaseModel):
 
     class Config:
         allow_population_by_alias = True
-        populate_by_name = True
+        allow_population_by_field_name = True
 
 # Healthcheck
 @app.get("/")
@@ -125,14 +125,15 @@ async def list_models() -> Dict[str, List[str]]:
 # Modify config in-memory
 @app.post("/modify-file")
 async def modify_file(req: ModifyRequest) -> Dict[str, Any]:
-    if req.model_version not in MODEL_REPO_IDS:
+    mv = req.model_version
+    if mv not in MODEL_REPO_IDS:
         raise HTTPException(404, detail="Unknown model version")
-    config_store[req.model_version] = {
+    config_store[mv] = {
         "temperature": req.temperature,
         "token_limit": req.token_limit,
         "instructions": req.instructions,
     }
-    model_pipelines.pop(req.model_version, None)
+    model_pipelines.pop(mv, None)
     return {"success": True, "message": "Config updated in-memory"}
 
 # Run chat/fallback
@@ -175,11 +176,11 @@ async def train_model(
 ) -> Dict[str, Any]:
     if base_model not in MODEL_REPO_IDS:
         raise HTTPException(404, detail="Unknown model version")
-    texts = []
+    texts: List[str] = []
     for f in files:
         data = await f.read()
         if not data.startswith((b"\xFF\xD8", b"\x89PNG")):
-            texts.append(data.decode(errors="ignore"))
+            texts.append(data.decode("utf-8", errors="ignore"))
     if not texts:
         raise HTTPException(400, detail="No valid text data provided")
     job_id = str(uuid.uuid4())
