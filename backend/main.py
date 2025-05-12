@@ -15,8 +15,10 @@ import uuid
 import json
 from typing import List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
@@ -61,7 +63,7 @@ DB_NAME = os.getenv("MONGODB_DB_NAME")
 db = client.get_default_database() if not DB_NAME else client[DB_NAME]
 model_states = db["model_states"]
 
-# Mapping friendly names to HF repo IDs
+# Friendly name to HF repo mapping
 MODEL_REPO_IDS: Dict[str, str] = {
     "7B-BASE": "username/7b-base",
     "67B-CHAT": "username/67b-chat",
@@ -83,6 +85,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global exception handler for validation errors
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # return JSON with detail list
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 # In-memory stores
 progress_store: Dict[str, Dict[str, Any]] = {}
 model_pipelines: Dict[str, Any]        = {}
@@ -93,12 +101,12 @@ model_pipelines: Dict[str, Any]        = {}
 class ModifyRequest(BaseModel):
     model_version: str = Field(..., alias="modelVersion")
     temperature: float
-    token_limit: int = Field(..., alias="tokenLimit")
-    instructions: str = Field("", alias="instructions")
+    token_limit: int   = Field(..., alias="tokenLimit")
+    instructions: str  = Field("", alias="instructions")
 
     class Config:
         allow_population_by_alias = True
-        validate_by_name = True
+        populate_by_name = True
 
 class RunRequest(BaseModel):
     model_version: str = Field(..., alias="modelVersion")
@@ -106,7 +114,7 @@ class RunRequest(BaseModel):
 
     class Config:
         allow_population_by_alias = True
-        validate_by_name = True
+        populate_by_name = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4) Endpoints
@@ -117,27 +125,22 @@ async def healthcheck():
 
 @app.get("/models")
 async def list_models():
-    # Return friendly names available in MODEL_REPO_IDS or local dirs
     local = [d for d in os.listdir("models") if os.path.isdir(os.path.join("models", d))]
-    # Union friendly names and locals, preserving order
-    all_models = list(dict.fromkeys(list(MODEL_REPO_IDS.keys()) + local))
-    return {"models": all_models}
+    combined = list(dict.fromkeys(list(MODEL_REPO_IDS.keys()) + local))
+    return {"models": combined}
 
 @app.post("/modify-file")
 async def modify_file(req: ModifyRequest):
     mv = req.model_version
-    local_dir = os.path.join("models", mv)
-    cfg_path  = os.path.join(local_dir, "config.json")
-    if not os.path.isdir(local_dir) or not os.path.isfile(cfg_path):
+    cfg_path = os.path.join("models", mv, "config.json")
+    if not os.path.isfile(cfg_path):
         raise HTTPException(404, detail="Model folder or config.json missing")
 
-    with open(cfg_path, "r") as f:
-        cfg = json.load(f)
+    cfg = json.load(open(cfg_path))
     cfg["temperature"] = req.temperature
-    cfg["tokenLimit"]  = req.token_limit
-    cfg["instructions"] = req.instructions
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
+    cfg["tokenLimit"]    = req.token_limit
+    cfg["instructions"]  = req.instructions
+    json.dump(cfg, open(cfg_path, "w"), indent=2)
 
     model_pipelines.pop(mv, None)
     return {"success": True, "message": "Config updated"}
@@ -146,9 +149,9 @@ async def modify_file(req: ModifyRequest):
 async def run_model(req: RunRequest):
     mv = req.model_version
     prompt = req.prompt
-    local_dir = os.path.join("models", mv)
 
-    # Determine source: local, HF Hub, or OpenAI
+    # determine source
+    local_dir = os.path.join("models", mv)
     if os.path.isdir(local_dir):
         src = local_dir
     elif mv in MODEL_REPO_IDS and HF_HUB_TOKEN:
@@ -156,7 +159,7 @@ async def run_model(req: RunRequest):
     elif OPENAI_API_KEY:
         src = None
     else:
-        raise HTTPException(404, detail="Model not found locally or on HF Hub, and no OpenAI key")
+        raise HTTPException(404, detail="Model not found")
 
     if src:
         cfg     = AutoConfig.from_pretrained(src)
@@ -166,20 +169,14 @@ async def run_model(req: RunRequest):
             tok = AutoTokenizer.from_pretrained(src)
             mod = AutoModelForCausalLM.from_pretrained(src)
             model_pipelines[mv] = pipeline(
-                "text-generation",
-                model=mod,
-                tokenizer=tok,
-                device_map="auto",
+                "text-generation", model=mod, tokenizer=tok, device_map="auto"
             )
-        gen = model_pipelines[mv]
-        out = gen(prompt, max_length=max_len, temperature=temp)
+        out = model_pipelines[mv](prompt, max_length=max_len, temperature=temp)
         text = out[0]["generated_text"]
     else:
         resp = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.7,
-            max_tokens=150,
+            model="gpt-4", messages=[{"role":"user","content":prompt}],
+            temperature=0.7, max_tokens=150,
         )
         text = resp.choices[0].message.content.strip()
 
@@ -187,16 +184,14 @@ async def run_model(req: RunRequest):
 
 @app.post("/train")
 async def train_model(
-    base_model: str = Form(...),
-    trainingObjective: str = Form(...),
-    files: List[UploadFile] = File(...),
-    background_tasks: BackgroundTasks = None,
+    base_model: str = Form(...), trainingObjective: str = Form(...),
+    files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = None,
 ):
     texts: List[str] = []
     for f in files:
         data = await f.read()
-        if not (data.startswith(b"\xFF\xD8") or data.startswith(b"\x89PNG")):
-            texts.append(data.decode("utf-8", errors="ignore"))
+        if not data.startswith((b"\xFF\xD8", b"\x89PNG")):
+            texts.append(data.decode(errors="ignore"))
     if not texts:
         raise HTTPException(400, detail="No valid text data provided")
 
@@ -204,6 +199,7 @@ async def train_model(
     progress_store[job_id] = {"percent":0, "status":"in_progress"}
     background_tasks.add_task(_run_training, job_id, base_model, texts)
     return {"job_id": job_id, "status": "training_started"}
+
 
 def _run_training(job_id: str, base_model: str, texts: List[str]):
     try:
@@ -221,21 +217,14 @@ def _run_training(job_id: str, base_model: str, texts: List[str]):
 
         out_dir = os.path.join("models", f"{base_model}-ft-{job_id}")
         args = TrainingArguments(
-            output_dir=out_dir,
-            num_train_epochs=3,
-            per_device_train_batch_size=2,
-            logging_steps=10,
-            save_steps=50,
-            push_to_hub=bool(HF_HUB_TOKEN),
-            hub_token=HF_HUB_TOKEN,
+            output_dir=out_dir, num_train_epochs=3, per_device_train_batch_size=2,
+            logging_steps=10, save_steps=50,
+            push_to_hub=bool(HF_HUB_TOKEN), hub_token=HF_HUB_TOKEN,
             hub_model_id=HF_HUB_REPO_ID or f"{base_model}-ft-{job_id}",
         )
         trainer = Trainer(model=mod, args=args, train_dataset=ds, tokenizer=tok)
-        trainer.train()
-        trainer.save_model(out_dir)
-        if HF_HUB_TOKEN:
-            trainer.push_to_hub()
-
+        trainer.train(); trainer.save_model(out_dir)
+        if HF_HUB_TOKEN: trainer.push_to_hub()
         progress_store[job_id] = {"percent":100, "status":"completed"}
     except Exception:
         logging.exception("Training failed")
@@ -247,7 +236,9 @@ async def get_progress(job_id: str):
         return progress_store[job_id]
     raise HTTPException(404, detail="Job not found")
 
-# Run with Uvicorn
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) Run Uvicorn
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8000")), reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8080")), reload=True)
