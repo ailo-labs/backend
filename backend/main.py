@@ -5,14 +5,13 @@ Ailo Forge Backend (main.py)
 Features:
   • List available models
   • Modify in-memory model generation settings
-  • Chat with HF Hub models, or fallback to OpenAI GPT-4
-  • Fine-tune HF Hub models via Hugging Face Trainer with real checkpointing & optional Hub push
+  • Chat with HF Hub models via remote inference API, or fallback to OpenAI GPT-4
+  • Fine-tune HF Hub models via Hugging Face Trainer with checkpointing & optional Hub push
   • Pollable progress endpoint
 """
 import os
 import logging
 import uuid
-import json
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
@@ -24,18 +23,11 @@ from dotenv import load_dotenv
 
 # OpenAI v1 client
 from openai import OpenAI
-# Transformers
-from transformers import (
-    AutoConfig,
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    pipeline,
-    Trainer,
-    TrainingArguments,
-)
+# HF Inference API
+from huggingface_hub import InferenceApi, login as hf_login
+# Transformers for training
+from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from datasets import Dataset
-# HF Hub utilities
-from huggingface_hub import login as hf_login, snapshot_download
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Load env & init
@@ -43,25 +35,20 @@ from huggingface_hub import login as hf_login, snapshot_download
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# Optional MongoDB (unused core flows)
-if os.getenv("MONGO_URI"):
-    from motor.motor_asyncio import AsyncIOMotorClient
-    client_db = AsyncIOMotorClient(os.getenv("MONGO_URI"))
-    DB_NAME = os.getenv("MONGODB_DB_NAME")
-    db = client_db.get_default_database() if not DB_NAME else client_db[DB_NAME]
-
-# HF Hub auth
+# HF Hub auth and inference client
 HF_HUB_TOKEN = os.getenv("HF_HUB_TOKEN")
 if HF_HUB_TOKEN:
     hf_login(HF_HUB_TOKEN)
-    logging.info(f"Logged into HF Hub with token: {HF_HUB_TOKEN[:8]}... ")
+    logging.info("Logged into HF Hub")
+    # create inference clients for each model
 else:
-    logging.warning("HF_HUB_TOKEN not set; HF Hub downloads disabled")
+    logging.warning("HF_HUB_TOKEN not set; HF inference disabled")
 
 # OpenAI client
 client_openai: Optional[OpenAI] = None
-if os.getenv("OPENAI_API_KEY"):
-    client_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_KEY:
+    client_openai = OpenAI(api_key=OPENAI_KEY)
     logging.info("OpenAI client configured")
 else:
     logging.warning("OPENAI_API_KEY not set; GPT-4 fallback disabled")
@@ -77,18 +64,21 @@ MODEL_REPO_IDS: Dict[str, str] = {
     "DEEPSEEK-CODER-33B": "deepseek/coder-33b",
 }
 
+# instantiate inference clients map
+inference_clients: Dict[str, InferenceApi] = {}
+if HF_HUB_TOKEN:
+    for key, repo in MODEL_REPO_IDS.items():
+        inference_clients[key] = InferenceApi(repo, token=HF_HUB_TOKEN)
+
 # In-memory stores
 config_store: Dict[str, Dict[str, Any]] = {}
 progress_store: Dict[str, Dict[str, Any]] = {}
-model_pipelines: Dict[str, Any] = {}
 
 # Create app
 app = FastAPI(title="Ailo Forge", version="1.0.0", debug=True)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
 # Validation error handler
@@ -102,7 +92,6 @@ class ModifyRequest(BaseModel):
     temperature: float
     token_limit: int = Field(..., alias="tokenLimit")
     instructions: str = Field("", alias="instructions")
-
     class Config:
         allow_population_by_alias = True
         allow_population_by_field_name = True
@@ -110,24 +99,21 @@ class ModifyRequest(BaseModel):
 class RunRequest(BaseModel):
     model_version: str = Field(..., alias="modelVersion")
     prompt: str
-
     class Config:
         allow_population_by_alias = True
         allow_population_by_field_name = True
 
-# Healthcheck
+# Endpoints
 @app.get("/")
-async def healthcheck() -> Dict[str, str]:
-    return {"status": "ok", "message": "Ailo Forge backend live"}
+async def healthcheck():
+    return {"status": "ok", "message": "Ailo Forge live"}
 
-# List models
 @app.get("/models")
-async def list_models() -> Dict[str, List[str]]:
+async def list_models():
     return {"models": list(MODEL_REPO_IDS.keys())}
 
-# Modify config in-memory
 @app.post("/modify-file")
-async def modify_file(req: ModifyRequest) -> Dict[str, Any]:
+async def modify_file(req: ModifyRequest):
     mv = req.model_version
     if mv not in MODEL_REPO_IDS:
         raise HTTPException(404, detail="Unknown model version")
@@ -136,34 +122,27 @@ async def modify_file(req: ModifyRequest) -> Dict[str, Any]:
         "token_limit": req.token_limit,
         "instructions": req.instructions,
     }
-    model_pipelines.pop(mv, None)
-    return {"success": True, "message": "Config updated in-memory"}
+    return {"success": True, "message": "Config updated"}
 
-# Run chat/fallback
 @app.post("/run")
-async def run_model(req: RunRequest) -> Dict[str, Any]:
+async def run_model(req: RunRequest):
     mv, prompt = req.model_version, req.prompt
-    if mv not in MODEL_REPO_IDS and not client_openai:
-        raise HTTPException(404, detail="Model not available")
     cfg = config_store.get(mv, {})
     temp = cfg.get("temperature", 0.7)
     max_len = cfg.get("token_limit", 150)
     instr = cfg.get("instructions", "")
 
-    repo_id = MODEL_REPO_IDS.get(mv)
-    if repo_id and HF_HUB_TOKEN:
+    # HF Inference API path
+    client = inference_clients.get(mv)
+    if client:
+        full_prompt = instr + "\n" + prompt if instr else prompt
         try:
-            src = snapshot_download(repo_id, cache_dir="models")
+            resp = client(inputs=full_prompt, parameters={"max_new_tokens": max_len, "temperature": temp})
+            text = resp.get("generated_text") or resp.get("choices", [{}])[0].get("text", "")
         except Exception as e:
-            logging.error(f"HF download failed for {repo_id}: {e}")
-            raise HTTPException(502, detail=f"HF download failed: {e}")
-        if mv not in model_pipelines:
-            tok = AutoTokenizer.from_pretrained(src)
-            mod = AutoModelForCausalLM.from_pretrained(src)
-            model_pipelines[mv] = pipeline("text-generation", model=mod, tokenizer=tok, device_map="auto")
-        full_prompt = f"{instr}\n{prompt}".strip()
-        out = model_pipelines[mv](full_prompt, max_length=max_len, temperature=temp)
-        text = out[0]["generated_text"]
+            logging.error(f"HF Inference failed for {mv}: {e}")
+            raise HTTPException(502, detail=f"HF inference failed: {e}")
+    # OpenAI fallback
     elif client_openai:
         resp = client_openai.chat.completions.create(
             model="gpt-4",
@@ -173,70 +152,61 @@ async def run_model(req: RunRequest) -> Dict[str, Any]:
         )
         text = resp.choices[0].message.content.strip()
     else:
-        raise HTTPException(404, detail="No valid model source available")
+        raise HTTPException(404, detail="No valid inference source available")
 
     return {"success": True, "response": text}
 
-# Train endpoint
 @app.post("/train")
 async def train_model(
-    base_model: str = Form(...), trainingObjective: str = Form(...),
+    base_model: str = Form(...), objective: str = Form(...),
     files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = None
-) -> Dict[str, Any]:
+):
     if base_model not in MODEL_REPO_IDS:
         raise HTTPException(404, detail="Unknown model version")
-    texts: List[str] = []
+    texts = []
     for f in files:
         data = await f.read()
-        if not data.startswith((b"\xFF\xD8", b"\x89PNG")):
-            texts.append(data.decode("utf-8", errors="ignore"))
+        if data.startswith((b"\xFF\xD8", b"\x89PNG")): continue
+        texts.append(data.decode("utf-8", errors="ignore"))
     if not texts:
         raise HTTPException(400, detail="No valid text data provided")
     job_id = str(uuid.uuid4())
     progress_store[job_id] = {"percent": 0, "status": "in_progress"}
-    background_tasks.add_task(_run_training, job_id, base_model, texts, trainingObjective)
-    return {"job_id": job_id, "status": "training_started"}
+    background_tasks.add_task(_run_training, job_id, base_model, texts, objective)
+    return {"job_id": job_id, "status": "in_progress"}
 
 # Background training
 
-def _run_training(job_id: str, base_model: str, texts: List[str], objective: str) -> None:
+def _run_training(job_id: str, base_model: str, texts: List[str], objective: str):
     try:
-        repo_id = MODEL_REPO_IDS[base_model]
-        src = snapshot_download(repo_id, cache_dir="models")
-        tok = AutoTokenizer.from_pretrained(src)
-        mod = AutoModelForCausalLM.from_pretrained(src)
-        ds = Dataset.from_dict({"text": texts})
+        repo = MODEL_REPO_IDS[base_model]
+        tok = AutoTokenizer.from_pretrained(repo)
+        mod = AutoModelForCausalLM.from_pretrained(repo)
+        ds = Dataset.from_dict({"text":texts})
         ds = ds.map(lambda x: tok(x["text"], truncation=True, max_length=128), batched=True)
         out_dir = os.path.join("models", f"{base_model}-ft-{job_id}")
         args = TrainingArguments(
-            output_dir=out_dir,
-            num_train_epochs=3,
-            per_device_train_batch_size=2,
-            logging_steps=10,
-            save_steps=50,
-            push_to_hub=bool(HF_HUB_TOKEN),
-            hub_token=HF_HUB_TOKEN,
-            hub_model_id=HF_HUB_REPO_ID or f"{base_model}-ft-{job_id}" 
+            output_dir=out_dir, num_train_epochs=3, per_device_train_batch_size=2,
+            logging_steps=10, save_steps=50,
+            push_to_hub=bool(HF_HUB_TOKEN), hub_token=HF_HUB_TOKEN,
+            hub_model_id=os.getenv("HF_HUB_REPO_ID") or f"{base_model}-ft-{job_id}"
         )
         trainer = Trainer(model=mod, args=args, train_dataset=ds, tokenizer=tok)
         trainer.train()
         trainer.save_model(out_dir)
-        if HF_HUB_TOKEN:
-            trainer.push_to_hub()
-        progress_store[job_id] = {"percent": 100, "status": "completed"}
+        if HF_HUB_TOKEN: trainer.push_to_hub()
+        progress_store[job_id] = {"percent":100, "status":"completed"}
     except Exception:
         logging.exception("Training failed")
-        progress_store[job_id] = {"percent": 0, "status": "failed"}
+        progress_store[job_id] = {"percent":0, "status":"failed"}
 
-# Progress
 @app.get("/progress/{job_id}")
-async def get_progress(job_id: str) -> Dict[str, Any]:
+async def get_progress(job_id: str):
     if job_id in progress_store:
         return progress_store[job_id]
     raise HTTPException(404, detail="Job not found")
 
-# Run
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT","8080"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
