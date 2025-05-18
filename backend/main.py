@@ -14,7 +14,6 @@ import uuid
 from typing import List, Dict, Any
 
 import requests
-import openai
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -24,18 +23,21 @@ from dotenv import load_dotenv
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from datasets import Dataset
 
+# OpenAI v1 client
+from openai import OpenAI
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Load env & init
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# OpenAI GPT-4 setup
+# OpenAI GPT-4 client
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is required for chat fallback")
-openai.api_key = OPENAI_API_KEY
-logging.info("Configured OpenAI GPT-4 client")
+client_openai = OpenAI(api_key=OPENAI_API_KEY)
+logging.info("Configured OpenAI GPT-4 client via OpenAI v1 library")
 
 # Hugging Face API token for Inference & Hub
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
@@ -47,7 +49,7 @@ chat_config: Dict[str, Dict[str, Any]] = {}
 train_progress: Dict[str, Dict[str, Any]] = {}
 
 # FastAPI setup
-app = FastAPI(title="Ailo Forge", version="4.2.0", debug=True)
+app = FastAPI(title="Ailo Forge", version="4.3.0", debug=True)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -85,7 +87,6 @@ async def healthcheck():
 
 @app.post("/modify-chat")
 async def modify_chat(req: ModifyChat):
-    # Save settings per model
     chat_config[req.model_id] = {
         "temperature": req.temperature,
         "max_tokens": req.token_limit,
@@ -93,26 +94,23 @@ async def modify_chat(req: ModifyChat):
     }
     return {"success": True, "message": f"Chat settings updated for {req.model_id}"}
 
-# Alias for backward compatibility
 @app.post("/modify-file")
 async def modify_file_alias(req: ModifyChat):
     return await modify_chat(req)
 
 @app.post("/run")
 async def run_chat(req: RunChat):
-    # Retrieve per-model settings or defaults
     settings = chat_config.get(req.model_id, {})
     temperature = settings.get('temperature', 0.7)
     max_tokens = settings.get('max_tokens', 150)
     instructions = settings.get('instructions', "")
 
-    # Build message list
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
     messages.append({"role": "user", "content": req.prompt})
 
-    # 1) Try Hugging Face Inference API
+    # 1) Try HF Inference API
     if HF_API_TOKEN:
         hf_url = f"https://api-inference.huggingface.co/models/{req.model_id}"
         headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
@@ -136,7 +134,7 @@ async def run_chat(req: RunChat):
 
     # 2) Fallback to OpenAI GPT-4
     try:
-        resp = openai.ChatCompletion.create(
+        resp = client_openai.chat.completions.create(
             model="gpt-4",
             messages=messages,
             temperature=temperature,
