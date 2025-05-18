@@ -3,7 +3,7 @@
 Ailo Forge Backend (main.py)
 
 Features:
-  • Modify in-memory chat settings (temperature, tokens, instructions)
+  • Modify in-memory chat settings per-model (temperature, tokens, instructions)
   • Chat via any Hugging Face model's Inference API (using HF_API_TOKEN) or fallback to OpenAI GPT-4
   • Fine-tune Hugging Face Hub models via Trainer with optional push to Hub
   • Pollable fine-tune progress endpoint
@@ -42,12 +42,12 @@ HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 if not HF_API_TOKEN:
     logging.warning("HF_API_TOKEN not set; HF Inference and push disabled")
 
-# In-memory stores
-chat_config: Dict[str, Any] = {}
+# In-memory stores keyed by model_id
+chat_config: Dict[str, Dict[str, Any]] = {}
 train_progress: Dict[str, Dict[str, Any]] = {}
 
 # FastAPI setup
-app = FastAPI(title="Ailo Forge", version="4.1.0", debug=True)
+app = FastAPI(title="Ailo Forge", version="4.2.0", debug=True)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -61,6 +61,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # 2) Schemas
 # ─────────────────────────────────────────────────────────────────────────────
 class ModifyChat(BaseModel):
+    model_id: str = Field(..., alias="modelId")
     temperature: float
     token_limit: int = Field(..., alias="tokenLimit")
     instructions: str = Field("", alias="instructions")
@@ -84,12 +85,13 @@ async def healthcheck():
 
 @app.post("/modify-chat")
 async def modify_chat(req: ModifyChat):
-    chat_config['settings'] = {
+    # Save settings per model
+    chat_config[req.model_id] = {
         "temperature": req.temperature,
         "max_tokens": req.token_limit,
         "instructions": req.instructions,
     }
-    return {"success": True, "message": "Chat settings updated"}
+    return {"success": True, "message": f"Chat settings updated for {req.model_id}"}
 
 # Alias for backward compatibility
 @app.post("/modify-file")
@@ -98,12 +100,13 @@ async def modify_file_alias(req: ModifyChat):
 
 @app.post("/run")
 async def run_chat(req: RunChat):
-    settings = chat_config.get('settings', {})
+    # Retrieve per-model settings or defaults
+    settings = chat_config.get(req.model_id, {})
     temperature = settings.get('temperature', 0.7)
     max_tokens = settings.get('max_tokens', 150)
     instructions = settings.get('instructions', "")
 
-    # Build OpenAI-style messages
+    # Build message list
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
@@ -129,7 +132,7 @@ async def run_chat(req: RunChat):
                 text = data.get('generated_text') or json.dumps(data)
             return {"success": True, "response": text}
         except Exception as e:
-            logging.warning(f"HF Inference failed: {e}; falling back to OpenAI")
+            logging.warning(f"HF Inference failed for {req.model_id}: {e}; falling back to OpenAI")
 
     # 2) Fallback to OpenAI GPT-4
     try:
