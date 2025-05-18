@@ -47,7 +47,7 @@ chat_config: Dict[str, Any] = {}
 train_progress: Dict[str, Dict[str, Any]] = {}
 
 # FastAPI setup
-app = FastAPI(title="Ailo Forge", version="4.0.0", debug=True)
+app = FastAPI(title="Ailo Forge", version="4.1.0", debug=True)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -91,6 +91,11 @@ async def modify_chat(req: ModifyChat):
     }
     return {"success": True, "message": "Chat settings updated"}
 
+# Alias for backward compatibility
+@app.post("/modify-file")
+async def modify_file_alias(req: ModifyChat):
+    return await modify_chat(req)
+
 @app.post("/run")
 async def run_chat(req: RunChat):
     settings = chat_config.get('settings', {})
@@ -116,7 +121,6 @@ async def run_chat(req: RunChat):
             hf_resp = requests.post(hf_url, headers=headers, json=payload, timeout=30)
             hf_resp.raise_for_status()
             data = hf_resp.json()
-            # HF returns list or dict
             if isinstance(data, list) and 'generated_text' in data[0]:
                 text = data[0]['generated_text']
             elif isinstance(data, dict) and 'generated_text' in data:
