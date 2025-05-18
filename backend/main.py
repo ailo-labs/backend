@@ -4,7 +4,7 @@ Ailo Forge Backend (main.py)
 
 Features:
   • Modify in-memory chat settings (temperature, tokens, instructions)
-  • Chat via any Hugging Face model's Inference API or fallback to OpenAI GPT-4
+  • Chat via any Hugging Face model's Inference API (using HF_API_TOKEN) or fallback to OpenAI GPT-4
   • Fine-tune Hugging Face Hub models via Trainer with optional push to Hub
   • Pollable fine-tune progress endpoint
 """
@@ -84,7 +84,6 @@ async def healthcheck():
 
 @app.post("/modify-chat")
 async def modify_chat(req: ModifyChat):
-    # store under single key
     chat_config['settings'] = {
         "temperature": req.temperature,
         "max_tokens": req.token_limit,
@@ -99,25 +98,25 @@ async def run_chat(req: RunChat):
     max_tokens = settings.get('max_tokens', 150)
     instructions = settings.get('instructions', "")
 
-    # build messages for OpenAI
+    # Build OpenAI-style messages
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
     messages.append({"role": "user", "content": req.prompt})
 
-    # 1) Try HF Inference API
+    # 1) Try Hugging Face Inference API
     if HF_API_TOKEN:
         hf_url = f"https://api-inference.huggingface.co/models/{req.model_id}"
         headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
         payload = {
-            "inputs": {"past_user_inputs": [], "generated_responses": [], "text": req.prompt},
+            "inputs": req.prompt,
             "parameters": {"temperature": temperature, "max_new_tokens": max_tokens},
         }
         try:
             hf_resp = requests.post(hf_url, headers=headers, json=payload, timeout=30)
             hf_resp.raise_for_status()
             data = hf_resp.json()
-            # HF Chat API returns a dict with 'generated_text' or list
+            # HF returns list or dict
             if isinstance(data, list) and 'generated_text' in data[0]:
                 text = data[0]['generated_text']
             elif isinstance(data, dict) and 'generated_text' in data:
@@ -151,13 +150,12 @@ async def train_model(
     texts: List[str] = []
     for f in files:
         data = await f.read()
-        if not data.startswith((b"\xFF\xD8", b"\x89PNG")):
-            texts.append(data.decode("utf-8", errors="ignore"))
+        if data.startswith((b"\xFF\xD8", b"\x89PNG")): continue
+        texts.append(data.decode("utf-8", errors="ignore"))
     if not texts:
         raise HTTPException(400, detail="No valid text data provided")
     job_id = str(uuid.uuid4())
-    train_progress = {"percent": 0, "status": "in_progress"}
-    train_progress[job_id] = train_progress
+    train_progress[job_id] = {"percent": 0, "status": "in_progress"}
     background_tasks.add_task(_run_training, job_id, repo_id, texts)
     return {"job_id": job_id, "status": "training_started"}
 
@@ -168,7 +166,7 @@ async def get_progress(job_id: str):
     return train_progress[job_id]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Background training logic
+# 4) Background Training Function
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_training(job_id: str, repo_id: str, texts: List[str]):
     try:
