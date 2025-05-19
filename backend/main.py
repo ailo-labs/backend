@@ -1,150 +1,161 @@
 #!/usr/bin/env python3
 """
-Ailo Forge Backend (main.py)
+Ailo Forge Backend (main.py):
 
-Features:
-  • Modify in-memory chat settings per-model (temperature, tokens, instructions)
-  • Chat via any Hugging Face model's Inference API (using HF_API_TOKEN) or fallback to OpenAI GPT-4
-  • Fine-tune Hugging Face Hub models via Trainer with optional push to Hub
-  • Pollable fine-tune progress endpoint
+• /models        → list available public HF models
+• /modify-file   → set (in-memory) chat parameters per model
+• /run           → generate text via HF Inference API, fallback to OpenAI GPT-4
+• /train         → stubbed fine-tune (with progress polling)
 """
-import os
-import logging
-import uuid
+import os, logging, uuid, requests
 from typing import List, Dict, Any
-
-import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from openai import OpenAI
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from datasets import Dataset
 
-# OpenAI v1 client
-from openai import OpenAI
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) Load env & init
+# 1) ENV + CLIENT SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# OpenAI GPT-4 client
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is required for chat fallback")
-client_openai = OpenAI(api_key=OPENAI_API_KEY)
-logging.info("Configured OpenAI GPT-4 client via OpenAI v1 library")
-
-# Hugging Face API token for Inference & Hub
+# HuggingFace Inference
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 if not HF_API_TOKEN:
-    logging.warning("HF_API_TOKEN not set; HF Inference and push disabled")
+    logging.warning("HF_API_TOKEN not set—HF Inference disabled")
 
-# In-memory stores keyed by model_id
-chat_config: Dict[str, Dict[str, Any]] = {}
-train_progress: Dict[str, Dict[str, Any]] = {}
+# OpenAI fallback (GPT-4)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    logging.error("OPENAI_API_KEY is required for GPT-4 fallback")
+    raise RuntimeError("Missing OPENAI_API_KEY")
+client_openai = OpenAI(api_key=OPENAI_API_KEY)
 
-# FastAPI setup
-app = FastAPI(title="Ailo Forge", version="4.3.0", debug=True)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+# In-memory stores
+chat_cfg: Dict[str, Dict[str, Any]] = {}       # modelId → {temperature,max_tokens,instructions}
+train_progress: Dict[str, Dict[str, Any]] = {} # job_id → {percent,status}
+
+# Public HF models (no license gating)
+PUBLIC_MODELS = [
+    "mistralai/mistral-7b",
+    "tiiuae/falcon-40b",
+    "EleutherAI/gpt-j-6B",
+    "EleutherAI/gpt-neo-2.7B",
+    "google/flan-t5-large",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) FASTAPI SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Ailo Forge", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+async def validation_error(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) Schemas
+# 3) SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
 class ModifyChat(BaseModel):
-    model_id: str = Field(..., alias="modelId")
+    model_id:    str    = Field(..., alias="modelId")
     temperature: float
-    token_limit: int = Field(..., alias="tokenLimit")
-    instructions: str = Field("", alias="instructions")
+    token_limit: int    = Field(..., alias="tokenLimit")
+    instructions:str    = Field("", alias="instructions")
     class Config:
-        allow_population_by_alias = True
+        allow_population_by_alias   = True
         allow_population_by_field_name = True
 
 class RunChat(BaseModel):
     model_id: str = Field(..., alias="modelId")
-    prompt: str
+    prompt:   str
     class Config:
-        allow_population_by_alias = True
+        allow_population_by_alias   = True
         allow_population_by_field_name = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) Endpoints
+# 4) ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def healthcheck():
-    return {"status": "ok", "message": "Ailo Forge backend live"}
+    return {"status":"ok","message":"Ailo Forge backend is live"}
+
+@app.get("/models")
+async def list_models():
+    # Return the friendly list of public models
+    return {"models": PUBLIC_MODELS}
 
 @app.post("/modify-chat")
 async def modify_chat(req: ModifyChat):
-    chat_config[req.model_id] = {
+    # Store per-model chat settings in memory
+    chat_cfg[req.model_id] = {
         "temperature": req.temperature,
-        "max_tokens": req.token_limit,
+        "max_tokens":  req.token_limit,
         "instructions": req.instructions,
     }
-    return {"success": True, "message": f"Chat settings updated for {req.model_id}"}
+    return {"success": True, "message": "✅ Model has been modified!"}
 
+# alias for backwards-compat
 @app.post("/modify-file")
 async def modify_file_alias(req: ModifyChat):
     return await modify_chat(req)
 
 @app.post("/run")
 async def run_chat(req: RunChat):
-    settings = chat_config.get(req.model_id, {})
-    temperature = settings.get('temperature', 0.7)
-    max_tokens = settings.get('max_tokens', 150)
-    instructions = settings.get('instructions', "")
+    # Gather settings or use defaults
+    cfg = chat_cfg.get(req.model_id, {})
+    temp    = cfg.get("temperature", 0.7)
+    max_tok = cfg.get("max_tokens", 150)
+    instr   = cfg.get("instructions", "")
 
-    messages = []
-    if instructions:
-        messages.append({"role": "system", "content": instructions})
-    messages.append({"role": "user", "content": req.prompt})
+    # Build the final prompt
+    full_input = instr.strip() + ("\n" + req.prompt if instr else req.prompt)
 
-    # 1) Try HF Inference API
+    # 1) Try HF Inference
     if HF_API_TOKEN:
         hf_url = f"https://api-inference.huggingface.co/models/{req.model_id}"
         headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
         payload = {
-            "inputs": req.prompt,
-            "parameters": {"temperature": temperature, "max_new_tokens": max_tokens},
+            "inputs": full_input,
+            "parameters": {"temperature": temp, "max_new_tokens": max_tok},
         }
         try:
-            hf_resp = requests.post(hf_url, headers=headers, json=payload, timeout=30)
-            hf_resp.raise_for_status()
-            data = hf_resp.json()
-            if isinstance(data, list) and 'generated_text' in data[0]:
-                text = data[0]['generated_text']
-            elif isinstance(data, dict) and 'generated_text' in data:
-                text = data['generated_text']
+            r = requests.post(hf_url, headers=headers, json=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            # HF returns either list of {generated_text} or dict
+            if isinstance(data, list) and "generated_text" in data[0]:
+                text = data[0]["generated_text"]
+            elif isinstance(data, dict) and "generated_text" in data:
+                text = data["generated_text"]
             else:
-                text = data.get('generated_text') or json.dumps(data)
+                text = data.get("generated_text", str(data))
             return {"success": True, "response": text}
         except Exception as e:
-            logging.warning(f"HF Inference failed for {req.model_id}: {e}; falling back to OpenAI")
+            logging.warning(f"HF Inference error for {req.model_id}: {e} — falling back to OpenAI")
 
-    # 2) Fallback to OpenAI GPT-4
+    # 2) Fallback to GPT-4
     try:
         resp = client_openai.chat.completions.create(
             model="gpt-4",
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            messages=[
+                {"role":"system", "content": instr} if instr else {},
+                {"role":"user",   "content": req.prompt}
+            ],
+            temperature=temp,
+            max_tokens=max_tok,
         )
         text = resp.choices[0].message.content.strip()
         return {"success": True, "response": text}
     except Exception as e:
-        logging.error(f"OpenAI error: {e}")
-        raise HTTPException(502, detail=str(e))
+        logging.error(f"OpenAI GPT-4 error: {e}")
+        raise HTTPException(502, detail="Both HF and OpenAI calls failed.")
 
 @app.post("/train")
 async def train_model(
@@ -152,17 +163,19 @@ async def train_model(
     files: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = None
 ):
-    texts: List[str] = []
+    # Collect text from uploads
+    texts = []
     for f in files:
-        data = await f.read()
-        if data.startswith((b"\xFF\xD8", b"\x89PNG")): continue
-        texts.append(data.decode("utf-8", errors="ignore"))
+        b = await f.read()
+        if not b.startswith((b"\xFF\xD8", b"\x89PNG")):
+            texts.append(b.decode("utf-8", errors="ignore"))
     if not texts:
-        raise HTTPException(400, detail="No valid text data provided")
-    job_id = str(uuid.uuid4())
-    train_progress[job_id] = {"percent": 0, "status": "in_progress"}
-    background_tasks.add_task(_run_training, job_id, repo_id, texts)
-    return {"job_id": job_id, "status": "training_started"}
+        raise HTTPException(400, detail="No valid text provided")
+
+    job = str(uuid.uuid4())
+    train_progress[job] = {"percent":0, "status":"in_progress"}
+    background_tasks.add_task(_run_training, job, repo_id, texts)
+    return {"job_id": job, "status":"training_started"}
 
 @app.get("/progress/{job_id}")
 async def get_progress(job_id: str):
@@ -171,35 +184,30 @@ async def get_progress(job_id: str):
     return train_progress[job_id]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) Background Training Function
+# 5) BACKGROUND TRAINING (stub)
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_training(job_id: str, repo_id: str, texts: List[str]):
     try:
-        tok = AutoTokenizer.from_pretrained(repo_id)
-        mod = AutoModelForCausalLM.from_pretrained(repo_id)
-        ds = Dataset.from_dict({"text": texts})
-        ds = ds.map(lambda x: tok(x['text'], truncation=True, max_length=128), batched=True)
+        tok   = AutoTokenizer.from_pretrained(repo_id)
+        mod   = AutoModelForCausalLM.from_pretrained(repo_id)
+        ds    = Dataset.from_dict({"text":texts})
+        ds    = ds.map(lambda x: tok(x["text"], truncation=True, max_length=128), batched=True)
+
         out_dir = f"models/ft-{job_id}"
         args = TrainingArguments(
             output_dir=out_dir,
             num_train_epochs=3,
             per_device_train_batch_size=2,
-            push_to_hub=bool(HF_API_TOKEN),
-            hub_token=HF_API_TOKEN,
-            hub_model_id=os.getenv("HF_HUB_REPO_ID") or f"ft-{job_id}",
+            push_to_hub=False
         )
-        trainer = Trainer(model=mod, args=args, train_dataset=ds, tokenizer=tok)
-        trainer.train()
-        trainer.save_model(out_dir)
-        if HF_API_TOKEN:
-            trainer.push_to_hub()
-        train_progress[job_id] = {"percent": 100, "status": "completed"}
-    except Exception:
+        tr = Trainer(mod, args, train_dataset=ds, tokenizer=tok)
+        tr.train(); tr.save_model(out_dir)
+        train_progress[job_id] = {"percent":100, "status":"completed"}
+    except:
         logging.exception("Training failed")
-        train_progress[job_id] = {"percent": 0, "status": "failed"}
+        train_progress[job_id] = {"percent":0,   "status":"failed"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=True)
